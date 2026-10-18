@@ -169,6 +169,7 @@ struct tap_hold_usage_t {
     int32_t* input_state;
     tap_hold_state_t* tap_hold_state;
     uint64_t pressed_at;
+    bool forced_hold = false; //
 };
 
 struct sticky_usage_t {
