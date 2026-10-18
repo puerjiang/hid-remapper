@@ -1099,6 +1099,14 @@ void process_mapping(bool auto_repeat) {
         if ((*tap_hold.input_state != 0) && (*(tap_hold.input_state + PREV_STATE_OFFSET) == 0)) {
             tap_hold.pressed_at = now;
         }
+        if (*tap_hold.input_state != 0) { 
+            for (uint32_t slot = 0; slot < used_state_slots; slot++) {
+                if (input_state[slot] != 0 && *(input_state + PREV_STATE_OFFSET + slot) == 0 && &input_state[slot] != tap_hold.input_state) { 
+                    tap_hold.pressed_at = now - tap_hold_threshold; // 强行将大写键按下时间推回历史，迫使其在当前帧瞬间完成 Hold 判定 
+                    break;
+                } 
+            } 
+        }
         tap_hold.tap_hold_state->tap =
             (*tap_hold.input_state == 0) && (*(tap_hold.input_state + PREV_STATE_OFFSET) != 0) &&
             (now - tap_hold.pressed_at < tap_hold_threshold);
