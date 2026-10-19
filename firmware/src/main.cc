@@ -318,7 +318,7 @@ int main() {
             need_to_persist_config = false;
         }
 
-        print_stats_maybe();
+        //print_stats_maybe();
 
         activity_led_off_maybe();
     }
