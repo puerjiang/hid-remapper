@@ -34,6 +34,7 @@ const uint32_t MACRO_USAGE_PAGE = 0xFFF20000;
 const uint32_t EXPR_USAGE_PAGE = 0xFFF30000;
 const uint32_t REGISTER_USAGE_PAGE = 0xFFF50000;
 const uint32_t MIDI_USAGE_PAGE = 0xFFF70000;
+const uint32_t ADC_USAGE_PAGE = 0xFFF80000;
 
 const uint32_t ROLLOVER_USAGE = 0x00070001;
 
@@ -47,6 +48,10 @@ const uint8_t resolution_multiplier_masks[] = {
 std::vector<reverse_mapping_t> reverse_mapping;
 std::vector<reverse_mapping_t> reverse_mapping_macros;
 std::vector<reverse_mapping_t> reverse_mapping_layers;
+
+// HOKP 用：真实按键源（reverse_mapping / layers / macros 里所有非虚拟、非模拟、非相对 usage 的 source 指针）
+// 在 set_mapping_from_config() 末尾 / update_their_descriptor_derivates() 末尾重建
+static std::vector<map_source_t*> real_key_sources;
 
 std::unordered_map<uint8_t, std::unordered_map<uint32_t, usage_def_t>> our_usages;  // report_id -> usage -> usage_def
 std::unordered_map<uint32_t, usage_def_t> our_usages_flat;
@@ -125,6 +130,41 @@ uint16_t active_ports_mask = 0;
 
 uint8_t dpad_state = 0;
 
+// 判断 usage 是否属于"虚拟"页（不直接来自物理按键）
+static inline bool is_virtual_usage_page(uint32_t usage) {
+    uint32_t page = usage & 0xFFFF0000;
+    return (page == EXPR_USAGE_PAGE) ||
+           (page == REGISTER_USAGE_PAGE) ||
+           (page == LAYERS_USAGE_PAGE) ||
+           (page == MACRO_USAGE_PAGE) ||
+           (page == GPIO_USAGE_PAGE) ||
+           (page == DIGIPOT_USAGE_PAGE) ||
+           (page == DPAD_USAGE_PAGE) ||
+           (page == MIDI_USAGE_PAGE) ||
+           (page == ADC_USAGE_PAGE);
+}
+
+// 重建 real_key_sources。依赖：
+//  - reverse_mapping / reverse_mapping_layers / reverse_mapping_macros 的 sources 已构建
+//  - 各 source 的 is_binary / is_relative 已由 update_their_descriptor_derivates() 设置
+// 调用点：update_their_descriptor_derivates() 末尾（其中 set_mapping_from_config() 也会间接调用到）
+static void rebuild_real_key_sources() {
+    real_key_sources.clear();
+    auto collect = [](std::vector<reverse_mapping_t>& mappings) {
+        for (auto& rev_map : mappings) {
+            for (auto& src : rev_map.sources) {
+                if (is_virtual_usage_page(src.usage)) continue;
+                if (!src.is_binary) continue;            // 排除相对轴/模拟轴（鼠标移动、摇杆等不应触发 HOKP）
+                if (src.input_state == NULL) continue;   // 防御性
+                real_key_sources.push_back(&src);
+            }
+        }
+    };
+    collect(reverse_mapping);
+    collect(reverse_mapping_layers);
+    collect(reverse_mapping_macros);
+}
+
 inline int32_t handle_scroll(map_source_t& map_source, uint32_t target_usage, int32_t movement, uint64_t now) {
     // movement is always non-zero
     int32_t ret = 0;
@@ -194,7 +234,6 @@ bool needs_to_be_sent(uint8_t report_id) {
 bool is_expr_valid(uint8_t expr) {
     int16_t on_stack = 0;
     for (auto const& elem : expressions[expr]) {
-        // should we have a data structure with each op's input/output instead?
         switch (elem.op) {
             case Op::DEBUG:
             case Op::EOL:
@@ -553,6 +592,8 @@ void set_mapping_from_config() {
             tap_hold_usages.push_back((tap_hold_usage_t){
                 .input_state = state_ptr,
                 .tap_hold_state = get_tap_hold_state_ptr(usage, hub_port),
+                .pressed_at = 0,
+                .forced_hold = false,
             });
         }
     }
@@ -1095,21 +1136,45 @@ void process_mapping(bool auto_repeat) {
     uint64_t now = get_time();
     frame_counter++;
 
+    // === Tap-hold 状态机 + Hold-on-other-key-press ===
     for (auto& tap_hold : tap_hold_usages) {
+        // 下降沿：记录按下时刻，清除 forced_hold
         if ((*tap_hold.input_state != 0) && (*(tap_hold.input_state + PREV_STATE_OFFSET) == 0)) {
             tap_hold.pressed_at = now;
+            tap_hold.forced_hold = false;
         }
-        if (*tap_hold.input_state != 0) { 
-            for (uint32_t slot = 0; slot < used_state_slots; slot++) {
-                if (input_state[slot] != 0 && *(input_state + PREV_STATE_OFFSET + slot) == 0 && &input_state[slot] != tap_hold.input_state) { 
-                    tap_hold.pressed_at = now - tap_hold_threshold; // 强行将大写键按下时间推回历史，迫使其在当前帧瞬间完成 Hold 判定 
+
+        // HOKP：本键按住且尚未 forced_hold 时，检查是否有其他真实按键本帧新按下
+        if ((*tap_hold.input_state != 0) && !tap_hold.forced_hold) {
+            bool other_new_press = false;
+            for (map_source_t* src : real_key_sources) {
+                if (src->input_state == tap_hold.input_state) {
+                    continue;  // 排除自己
+                }
+                // 排除未插端口的设备的残留状态
+                if ((src->orig_source_port != 0) &&
+                    !(active_ports_mask & (1 << src->orig_source_port))) {
+                    continue;
+                }
+                if ((*(src->input_state) != 0) &&
+                    (*(src->input_state + PREV_STATE_OFFSET) == 0)) {
+                    other_new_press = true;
                     break;
-                } 
-            } 
+                }
+            }
+            if (other_new_press) {
+                tap_hold.pressed_at = now - tap_hold_threshold;
+                tap_hold.forced_hold = true;
+            }
         }
+
+        // tap：抬起且未 forced_hold 且按下时长 < 阈值
         tap_hold.tap_hold_state->tap =
-            (*tap_hold.input_state == 0) && (*(tap_hold.input_state + PREV_STATE_OFFSET) != 0) &&
+            !tap_hold.forced_hold &&
+            (*tap_hold.input_state == 0) &&
+            (*(tap_hold.input_state + PREV_STATE_OFFSET) != 0) &&
             (now - tap_hold.pressed_at < tap_hold_threshold);
+
         tap_hold.tap_hold_state->prev_hold = tap_hold.tap_hold_state->hold;
         tap_hold.tap_hold_state->hold =
             (*tap_hold.input_state != 0) &&
@@ -1909,14 +1974,25 @@ void update_their_descriptor_derivates() {
     their_usages_rle.clear();
     rlencode(their_usage_ranges_set, their_usages_rle);
 
-    for (auto& rev_map : reverse_mapping) {
-        for (auto& map_source : rev_map.sources) {
-            map_source.is_relative = relative_usage_set.count(map_source.input_state) > 0;
-            map_source.is_binary = ((binary_usage_set.count(map_source.input_state) > 0) &&
-                                       (map_source.usage != H_SCROLL_USAGE) &&
-                                       !((map_source.usage >= 0x00010030) && (map_source.usage <= 0x00010039))) ||
-                                   ((map_source.usage & 0xFFFF0000) == GPIO_USAGE_PAGE);
+    // 为 reverse_mapping / reverse_mapping_layers / reverse_mapping_macros 的所有 source
+    // 设置 is_relative / is_binary（原本只设置了 reverse_mapping）
+    auto set_source_flags = [&](std::vector<reverse_mapping_t>& mappings) {
+        for (auto& rev_map : mappings) {
+            for (auto& map_source : rev_map.sources) {
+                map_source.is_relative = relative_usage_set.count(map_source.input_state) > 0;
+                map_source.is_binary = ((binary_usage_set.count(map_source.input_state) > 0) &&
+                                           (map_source.usage != H_SCROLL_USAGE) &&
+                                           !((map_source.usage >= 0x00010030) && (map_source.usage <= 0x00010039))) ||
+                                       ((map_source.usage & 0xFFFF0000) == GPIO_USAGE_PAGE);
+            }
         }
+    };
+    set_source_flags(reverse_mapping);
+    set_source_flags(reverse_mapping_layers);
+    set_source_flags(reverse_mapping_macros);
+
+    // reverse_mapping 的 target 还可能映射到外部设备的 out reports
+    for (auto& rev_map : reverse_mapping) {
         auto search = their_out_usages_flat.find(rev_map.target);
         if (search != their_out_usages_flat.end()) {
             rev_map.our_usages.clear();
@@ -1945,6 +2021,9 @@ void update_their_descriptor_derivates() {
                 });
         }
     }
+
+    // is_binary / is_relative 已就绪，重建 HOKP 用的真实按键源集合
+    rebuild_real_key_sources();
 }
 
 void parse_our_descriptor() {
@@ -2041,6 +2120,11 @@ void reset_state() {
     accumulated.clear();
     layer_state_mask = 1;
     frame_counter = 0;
+    // 清空 tap-hold 状态，避免 SUSPEND/RESUME 后 forced_hold / pressed_at 残留
+    for (auto& th : tap_hold_usages) {
+        th.pressed_at = 0;
+        th.forced_hold = false;
+    }
 }
 
 void set_monitor_enabled(bool enabled) {
