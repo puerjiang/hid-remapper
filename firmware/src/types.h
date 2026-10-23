@@ -138,15 +138,17 @@ struct map_source_t {
     bool hold = false;
     bool is_relative = false;
     bool is_binary = false;
+    bool seen_press = false; 
+    uint8_t pressed_layer_mask = 0; 
     uint8_t orig_source_port = 0;
     uint8_t layer_mask = 1;
     int32_t* input_state;
     tap_hold_state_t* tap_hold_state;
     uint8_t* sticky_state;
     int32_t accumulated_scroll;
-    uint64_t last_scroll_timestamp;  // XXX we can make this 32 or less bits
-    bool seen_press = false;
+    uint64_t last_scroll_timestamp;
 };
+
 
 struct out_usage_def_t {
     uint8_t* data;
@@ -170,8 +172,10 @@ struct tap_hold_usage_t {
     int32_t* input_state;
     tap_hold_state_t* tap_hold_state;
     uint64_t pressed_at;
-    bool forced_hold = false; //
+    bool forced_hold = false;
+    uint8_t pressed_layer_mask = 0; 
 };
+
 
 struct sticky_usage_t {
     int32_t* input_state;
