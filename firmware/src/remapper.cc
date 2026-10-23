@@ -144,6 +144,11 @@ static inline bool is_virtual_usage_page(uint32_t usage) {
            (page == ADC_USAGE_PAGE);
 }
 
+// 判断 usage 是否是键盘修饰键（Left Ctrl ~ Right GUI）
+static inline bool is_modifier_usage(uint32_t usage) {
+    return (usage >= 0x000700E0) && (usage <= 0x000700E7);
+}
+
 // 重建 real_key_sources。依赖：
 //  - reverse_mapping / reverse_mapping_layers / reverse_mapping_macros 的 sources 已构建
 //  - 各 source 的 is_binary / is_relative 已由 update_their_descriptor_derivates() 设置
@@ -1273,7 +1278,9 @@ void process_mapping(bool auto_repeat) {
             }
         }
     }
-    
+
+    // === 更新 map_source_t 的 seen_press（用于切层时过滤"只有抬起没有按下"的按键） ===
+    // 必须在 memcpy(input_state + PREV_STATE_OFFSET, ...) 之前，用 memcpy 前的 prev 检测边沿。
     {
         auto update_seen_press = [](std::vector<reverse_mapping_t>& mappings) {
             for (auto& rev_map : mappings) {
@@ -1360,34 +1367,36 @@ void process_mapping(bool auto_repeat) {
                             (map_source.hold && map_source.tap_hold_state->hold)) {
                             value += 1 * map_source.scaling / 1000 - rev_map.default_value;
                         }
-                    if (!map_source.tap && !map_source.hold) {
-                        if (map_source.is_relative && !register_target) {
-                            if (*map_source.input_state * map_source.scaling > 0) {
-                                value += 1;
-                            }
-                        } else {
-                            // binary（按键类）必须在本层可见期内见过按下，才允许输出非 default
-                            // 切层进入时 A 已按住但未在本层按下过 → 不输出
-                            bool allow_output = !map_source.is_binary || map_source.seen_press;
-                            if (allow_output &&
-                                ((*map_source.input_state != 0) || (rev_map.default_value != 0))) {
-                                int32_t candidate = *map_source.input_state;
-                                if (map_source.is_binary) {
-                                    candidate = !!candidate;
+                        if (!map_source.tap && !map_source.hold) {
+                            if (map_source.is_relative && !register_target) {
+                                if (*map_source.input_state * map_source.scaling > 0) {
+                                    value += 1;
                                 }
-                                if ((candidate != 0) || !map_source.is_binary) {
-                                    candidate = (int64_t) candidate * map_source.scaling / 1000;
-                                    if (((map_source.usage & 0xFFFF0000) == EXPR_USAGE_PAGE) ||
-                                        ((map_source.usage & 0xFFFF0000) == REGISTER_USAGE_PAGE)) {
-                                        candidate /= 1000;
+                            } else {
+                                // binary（按键类）必须在本层可见期内见过按下，才允许输出非 default。
+                                // 修饰键（0x000700E0 ~ 0x000700E7）例外，保持 level-sensitive，切层后立即生效。
+                                bool allow_output = !map_source.is_binary ||
+                                                    map_source.seen_press ||
+                                                    is_modifier_usage(map_source.usage);
+                                if (allow_output &&
+                                    ((*map_source.input_state != 0) || (rev_map.default_value != 0))) {
+                                    int32_t candidate = *map_source.input_state;
+                                    if (map_source.is_binary) {
+                                        candidate = !!candidate;
                                     }
-                                    if (candidate != rev_map.default_value) {
-                                        value += candidate - rev_map.default_value;
+                                    if ((candidate != 0) || !map_source.is_binary) {
+                                        candidate = (int64_t) candidate * map_source.scaling / 1000;
+                                        if (((map_source.usage & 0xFFFF0000) == EXPR_USAGE_PAGE) ||
+                                            ((map_source.usage & 0xFFFF0000) == REGISTER_USAGE_PAGE)) {
+                                            candidate /= 1000;
+                                        }
+                                        if (candidate != rev_map.default_value) {
+                                            value += candidate - rev_map.default_value;
+                                        }
                                     }
                                 }
                             }
                         }
-                    }
                     }
                 }
             }
