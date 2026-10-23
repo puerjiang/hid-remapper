@@ -1273,6 +1273,31 @@ void process_mapping(bool auto_repeat) {
             }
         }
     }
+    
+    {
+        auto update_seen_press = [](std::vector<reverse_mapping_t>& mappings) {
+            for (auto& rev_map : mappings) {
+                for (auto& src : rev_map.sources) {
+                    bool visible = (layer_state_mask & src.layer_mask) != 0;
+                    if (!visible) {
+                        src.seen_press = false;
+                        continue;
+                    }
+                    bool cur = (*src.input_state != 0);
+                    bool prev = (*(src.input_state + PREV_STATE_OFFSET) != 0);
+                    if (!prev && cur) {
+                        src.seen_press = true;   // 按下边沿
+                    } else if (prev && !cur) {
+                        src.seen_press = false;  // 抬起边沿
+                    }
+                    // 无变化时保持
+                }
+            }
+        };
+        update_seen_press(reverse_mapping);
+        update_seen_press(reverse_mapping_layers);
+        update_seen_press(reverse_mapping_macros);
+    }
 
     memcpy(input_state + PREV_STATE_OFFSET, input_state, used_state_slots * sizeof(input_state[0]));
     digipot_state[0] = 128;
@@ -1335,30 +1360,34 @@ void process_mapping(bool auto_repeat) {
                             (map_source.hold && map_source.tap_hold_state->hold)) {
                             value += 1 * map_source.scaling / 1000 - rev_map.default_value;
                         }
-                        if (!map_source.tap && !map_source.hold) {
-                            if (map_source.is_relative && !register_target) {
-                                if (*map_source.input_state * map_source.scaling > 0) {
-                                    value += 1;
+                    if (!map_source.tap && !map_source.hold) {
+                        if (map_source.is_relative && !register_target) {
+                            if (*map_source.input_state * map_source.scaling > 0) {
+                                value += 1;
+                            }
+                        } else {
+                            // binary（按键类）必须在本层可见期内见过按下，才允许输出非 default
+                            // 切层进入时 A 已按住但未在本层按下过 → 不输出
+                            bool allow_output = !map_source.is_binary || map_source.seen_press;
+                            if (allow_output &&
+                                ((*map_source.input_state != 0) || (rev_map.default_value != 0))) {
+                                int32_t candidate = *map_source.input_state;
+                                if (map_source.is_binary) {
+                                    candidate = !!candidate;
                                 }
-                            } else {
-                                if ((*map_source.input_state != 0) || (rev_map.default_value != 0)) {
-                                    int32_t candidate = *map_source.input_state;
-                                    if (map_source.is_binary) {
-                                        candidate = !!candidate;
+                                if ((candidate != 0) || !map_source.is_binary) {
+                                    candidate = (int64_t) candidate * map_source.scaling / 1000;
+                                    if (((map_source.usage & 0xFFFF0000) == EXPR_USAGE_PAGE) ||
+                                        ((map_source.usage & 0xFFFF0000) == REGISTER_USAGE_PAGE)) {
+                                        candidate /= 1000;
                                     }
-                                    if ((candidate != 0) || !map_source.is_binary) {
-                                        candidate = (int64_t) candidate * map_source.scaling / 1000;
-                                        if (((map_source.usage & 0xFFFF0000) == EXPR_USAGE_PAGE) ||
-                                            ((map_source.usage & 0xFFFF0000) == REGISTER_USAGE_PAGE)) {
-                                            candidate /= 1000;
-                                        }
-                                        if (candidate != rev_map.default_value) {
-                                            value += candidate - rev_map.default_value;
-                                        }
+                                    if (candidate != rev_map.default_value) {
+                                        value += candidate - rev_map.default_value;
                                     }
                                 }
                             }
                         }
+                    }
                     }
                 }
             }
