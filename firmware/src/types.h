@@ -145,6 +145,7 @@ struct map_source_t {
     uint8_t* sticky_state;
     int32_t accumulated_scroll;
     uint64_t last_scroll_timestamp;  // XXX we can make this 32 or less bits
+    bool seen_press = false;
 };
 
 struct out_usage_def_t {
