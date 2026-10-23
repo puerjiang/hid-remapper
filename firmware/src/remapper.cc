@@ -127,6 +127,8 @@ uint16_t active_ports_mask = 0;
 
 uint8_t dpad_state = 0;
 
+// === 工具函数 ===
+
 static inline bool is_virtual_usage_page(uint32_t usage) {
     uint32_t page = usage & 0xFFFF0000;
     return (page == EXPR_USAGE_PAGE) ||
@@ -163,6 +165,45 @@ static void rebuild_real_key_sources() {
     collect(reverse_mapping);
     collect(reverse_mapping_layers);
     collect(reverse_mapping_macros);
+}
+
+// 更新所有 source 的 seen_press / pressed_layer_mask
+// 语义：
+//  - 按下边沿：seen_press = true，若该 mapping 可见则记录 pressed_layer_mask = layer_state_mask & src.layer_mask
+//  - 抬起边沿：seen_press = false，pressed_layer_mask = 0
+//  - 不可见：seen_press = false（但保留 pressed_layer_mask 以便切回时恢复）
+//  - 可见且 pressed_layer_mask 与当前层有交集：恢复 seen_press = true
+static void update_all_seen_press() {
+    auto upd = [](std::vector<reverse_mapping_t>& mappings) {
+        for (auto& rev_map : mappings) {
+            for (auto& src : rev_map.sources) {
+                if (src.sticky) continue;
+
+                bool visible = (layer_state_mask & src.layer_mask) != 0;
+                bool cur = (*src.input_state != 0);
+                bool prev = (*(src.input_state + PREV_STATE_OFFSET) != 0);
+
+                if (!prev && cur) {
+                    src.seen_press = true;
+                    src.pressed_layer_mask = visible ? (layer_state_mask & src.layer_mask) : 0;
+                } else if (prev && !cur) {
+                    src.seen_press = false;
+                    src.pressed_layer_mask = 0;
+                }
+
+                if (visible) {
+                    if (cur && (src.pressed_layer_mask & layer_state_mask)) {
+                        src.seen_press = true;
+                    }
+                } else {
+                    src.seen_press = false;
+                }
+            }
+        }
+    };
+    upd(reverse_mapping);
+    upd(reverse_mapping_layers);
+    upd(reverse_mapping_macros);
 }
 
 inline int32_t handle_scroll(map_source_t& map_source, uint32_t target_usage, int32_t movement, uint64_t now) {
@@ -1053,14 +1094,14 @@ void process_mapping(bool auto_repeat) {
         bool cur = (*tap_hold.input_state != 0);
         bool prev = (*(tap_hold.input_state + PREV_STATE_OFFSET) != 0);
 
-        // 下降沿：记录按下时刻 / 按下时所在层，清除 forced_hold
+        // 下降沿：记录按下时刻，清除 forced_hold
+        // pressed_layer_mask 在 layer 计算之后统一补记录（见下方），这里不记录
         if (!prev && cur) {
             tap_hold.pressed_at = now;
             tap_hold.forced_hold = false;
-            tap_hold.pressed_layer_mask = layer_state_mask;
         }
 
-        // HOKP：本键按住且尚未 forced_hold 时，检查是否有其他真实按键本帧新按下
+        // HOKP
         if (cur && !tap_hold.forced_hold) {
             bool other_new_press = false;
             for (map_source_t* src : real_key_sources) {
@@ -1079,7 +1120,8 @@ void process_mapping(bool auto_repeat) {
             }
         }
 
-        // tap：抬起且未 forced_hold、按下时长 < 阈值、且按下时的层包含当前层
+        // tap：抬起且未 forced_hold、按下时长 < 阈值、且按下时层与当前层有交集
+        // 注意：此处 layer_state_mask 是上一帧的层（layer 计算在后面），这是 tap 判定的标准语义
         tap_hold.tap_hold_state->tap =
             !tap_hold.forced_hold &&
             !cur && prev &&
@@ -1142,6 +1184,15 @@ void process_mapping(bool auto_repeat) {
     }
     layer_state_mask = new_layer_state_mask;
 
+    // === 补记录 tap-hold 的 pressed_layer_mask（用更新后的 layer_state_mask） ===
+    for (auto& tap_hold : tap_hold_usages) {
+        bool cur = (*tap_hold.input_state != 0);
+        bool prev = (*(tap_hold.input_state + PREV_STATE_OFFSET) != 0);
+        if (!prev && cur) {
+            tap_hold.pressed_layer_mask = layer_state_mask;
+        }
+    }
+
     port_register = 0;
     for (uint8_t i = 0; i < NEXPRESSIONS; i++) {
         int32_t result = eval_expr(i, frame_counter, auto_repeat);
@@ -1172,44 +1223,9 @@ void process_mapping(bool auto_repeat) {
         }
     }
 
-    // === 更新 map_source_t 的 seen_press / pressed_layer_mask ===
-    // 用于切层时过滤"只有抬起没有按下"的按键；切回按下时所在层时恢复 seen_press。
-    {
-        auto update_seen_press = [](std::vector<reverse_mapping_t>& mappings) {
-            for (auto& rev_map : mappings) {
-                for (auto& src : rev_map.sources) {
-                    if (src.sticky) continue;  // sticky 不用 seen_press
-
-                    bool cur = (*src.input_state != 0);
-                    bool prev = (*(src.input_state + PREV_STATE_OFFSET) != 0);
-
-                    if (!prev && cur) {
-                        // 按下边沿
-                        src.seen_press = true;
-                        src.pressed_layer_mask = layer_state_mask;
-                    } else if (prev && !cur) {
-                        // 抬起边沿
-                        src.seen_press = false;
-                        src.pressed_layer_mask = 0;
-                    }
-
-                    bool visible = (layer_state_mask & src.layer_mask) != 0;
-                    if (visible) {
-                        if (cur && (src.pressed_layer_mask & layer_state_mask)) {
-                            // 切回按下时所在的层，恢复 seen_press
-                            src.seen_press = true;
-                        }
-                    } else {
-                        // 不可见时不输出；不清 pressed_layer_mask，以便切回时恢复
-                        src.seen_press = false;
-                    }
-                }
-            }
-        };
-        update_seen_press(reverse_mapping);
-        update_seen_press(reverse_mapping_layers);
-        update_seen_press(reverse_mapping_macros);
-    }
+    // === 更新 seen_press / pressed_layer_mask（用于切层时过滤孤立边沿） ===
+    // 必须在 memcpy(input_state + PREV_STATE_OFFSET, ...) 之前，用 memcpy 前的 prev 检测边沿。
+    update_all_seen_press();
 
     memcpy(input_state + PREV_STATE_OFFSET, input_state, used_state_slots * sizeof(input_state[0]));
     digipot_state[0] = 128;
@@ -1273,7 +1289,7 @@ void process_mapping(bool auto_repeat) {
                                     value += 1;
                                 }
                             } else {
-                                // binary（按键类）必须在本层可见期内见过按下，才允许输出非 default。
+                                // binary 按键必须在本层可见期内见过按下，才允许输出非 default。
                                 // 修饰键 / GPIO 输入例外，保持 level-sensitive。
                                 bool allow_output = !map_source.is_binary ||
                                                     map_source.seen_press ||
@@ -1462,10 +1478,7 @@ inline void read_input(const uint8_t* report, int len, uint32_t source_usage, co
         for (unsigned int i = 0; i < their_usage.count; i++) {
             uint32_t bits = get_bits(report, len, their_usage.bitpos + i * their_usage.size, their_usage.size);
             if (((their_usage.index_mask == 0) && (bits == their_usage.index)) ||
-                (their_usage.index_mask & (1 << bits))) {
-                value = 1;
-                break;
-            }
+                (their_usage.index_mask & (1 << bits))) { value = 1; break; }
         }
     } else {
         value = get_bits(report, len, their_usage.bitpos, their_usage.size);
@@ -1475,7 +1488,6 @@ inline void read_input(const uint8_t* report, int len, uint32_t source_usage, co
             }
         }
     }
-
     if (their_usage.is_relative) {
         if (their_usage.input_state_0 != NULL) *(their_usage.input_state_0) += value;
         if (their_usage.input_state_n != NULL) *(their_usage.input_state_n) = value;
